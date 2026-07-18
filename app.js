@@ -62,6 +62,30 @@ function parseSTL(buffer) {
 
 const AXIS_COLOR = { x: "#e5484d", y: "#3dd68c", z: "#4c9eff" };
 
+// ---------- STEP/IGES parsing via occt-import-js (WASM OpenCascade build) ----------
+// Loaded lazily from a CDN the first time a .stp/.step file is opened, so STL-only
+// users never pay for the (fairly large) WASM download.
+const OCCT_CDN_URL = "https://cdn.jsdelivr.net/npm/occt-import-js@0.0.23/dist/occt-import-js.js";
+let occtModulePromise = null;
+function loadOcct() {
+  if (occtModulePromise) return occtModulePromise;
+  occtModulePromise = new Promise((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = OCCT_CDN_URL;
+    script.onload = () => {
+      if (typeof window.occtimportjs !== "function") {
+        reject(new Error("CAD engine script loaded but did not initialize"));
+        return;
+      }
+      window.occtimportjs().then(resolve).catch(reject);
+    };
+    script.onerror = () => reject(new Error("Failed to load CAD engine from CDN"));
+    document.head.appendChild(script);
+  });
+  return occtModulePromise;
+}
+
+
 // ---------- DOM references ----------
 const mount = document.getElementById("three-mount");
 const viewport = document.getElementById("viewport");
@@ -116,7 +140,7 @@ grid.material.transparent = true;
 grid.material.opacity = 0.35;
 scene.add(grid);
 
-let mesh = null;
+let model = null; // a THREE.Group ("pivot") wrapping one or more meshes, centered at origin
 
 function resize() {
   const w = mount.clientWidth;
@@ -231,82 +255,148 @@ gridToggle.addEventListener("change", () => {
   grid.visible = gridToggle.checked;
 });
 
-// ---------- loading a model ----------
-function loadGeometry(positions, normals) {
-  if (mesh) {
-    scene.remove(mesh);
-    mesh.geometry.dispose();
-    mesh.material.dispose();
-    mesh = null;
+// ---------- building the 3D model ----------
+// specs: array of { positions: Float32Array, normals: Float32Array|null, index: Uint32Array|null, color: [r,g,b]|null }
+// One spec per part. A plain STL produces a single spec with no index (flat triangle soup).
+// A STEP assembly can produce many specs, one per solid/part, each indexed and optionally colored.
+function buildModel(specs) {
+  if (model) {
+    scene.remove(model);
+    model.traverse((obj) => {
+      if (obj.geometry) obj.geometry.dispose();
+      if (obj.material) obj.material.dispose();
+    });
+    model = null;
   }
-  const geometry = new THREE.BufferGeometry();
-  geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
-  geometry.setAttribute("normal", new THREE.BufferAttribute(normals, 3));
-  geometry.computeBoundingBox();
-  geometry.center();
-  geometry.computeBoundingSphere();
 
-  const bbox = geometry.boundingBox;
-  const size = new THREE.Vector3().subVectors(bbox.max, bbox.min);
+  const rawGroup = new THREE.Group();
+  for (const spec of specs) {
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute("position", new THREE.BufferAttribute(spec.positions, 3));
+    if (spec.normals) geometry.setAttribute("normal", new THREE.BufferAttribute(spec.normals, 3));
+    if (spec.index) geometry.setIndex(new THREE.BufferAttribute(spec.index, 1));
+    if (!spec.normals) geometry.computeVertexNormals();
+
+    const material = new THREE.MeshStandardMaterial({
+      color: spec.color ? new THREE.Color(spec.color[0], spec.color[1], spec.color[2]) : "#d7d2c6",
+      metalness: 0.08,
+      roughness: 0.55,
+      flatShading: !spec.index,
+      side: THREE.DoubleSide,
+    });
+    rawGroup.add(new THREE.Mesh(geometry, material));
+  }
+
+  const pivot = new THREE.Group();
+  pivot.add(rawGroup);
+  scene.add(pivot);
+  model = pivot;
+
+  rawGroup.updateMatrixWorld(true);
+  const box = new THREE.Box3().setFromObject(rawGroup);
+  const size = new THREE.Vector3();
+  box.getSize(size);
+  const center = new THREE.Vector3();
+  box.getCenter(center);
+  pivot.position.copy(center).multiplyScalar(-1);
+
   baseSize = { x: size.x || 0.001, y: size.y || 0.001, z: size.z || 0.001 };
 
-  const material = new THREE.MeshStandardMaterial({
-    color: "#d7d2c6",
-    metalness: 0.08,
-    roughness: 0.55,
-    flatShading: true,
-    side: THREE.DoubleSide,
-  });
-  mesh = new THREE.Mesh(geometry, material);
-  scene.add(mesh);
-
   scale = { x: 1, y: 1, z: 1 };
+  pivot.scale.set(1, 1, 1);
   setControlsEnabled(true);
   syncAxisUI();
   updateDims();
 
-  const radius = Math.max(geometry.boundingSphere.radius * 2.6, 0.5);
+  const sphereRadius = size.length() / 2;
+  const radius = Math.max(sphereRadius * 2.6, 0.5);
   cam.radius = radius;
   cam.target.set(0, 0, 0);
   cam.minR = radius * 0.03;
   cam.maxR = radius * 40;
 
-  const gridSize = Math.max(geometry.boundingSphere.radius * 4, 2);
+  const gridSize = Math.max(size.length() * 2, 2);
   grid.scale.setScalar(gridSize / 10);
-  grid.position.y = bbox.min.y;
+  grid.position.y = box.min.y - center.y;
 }
 
-function handleFile(file) {
-  if (!file) return;
-  errorEl.style.display = "none";
-  loadingEl.style.display = "flex";
-  dropzoneHint.style.display = "none";
+function onModelLoaded(name) {
+  fileName = name;
+  filenameDisplay.textContent = fileName;
+  screenshotBtn.disabled = false;
+  document.getElementById("upload-label").textContent = "Load another file";
+}
+
+function showError(message) {
+  errorEl.textContent = message;
+  errorEl.style.display = "block";
+  if (!model) dropzoneHint.style.display = "flex";
+}
+
+function handleSTL(file) {
   const reader = new FileReader();
   reader.onload = () => {
     try {
       const { positions, normals } = parseSTL(reader.result);
-      loadGeometry(positions, normals);
-      fileName = file.name;
-      filenameDisplay.textContent = fileName;
-      screenshotBtn.disabled = false;
-      document.getElementById("upload-label").textContent = "Load another file";
+      buildModel([{ positions, normals, index: null, color: null }]);
+      onModelLoaded(file.name);
     } catch (err) {
-      errorEl.textContent = "Couldn't read this as an STL file. Check it's a valid .stl export.";
-      errorEl.style.display = "block";
-      dropzoneHint.style.display = "flex";
+      showError("Couldn't read this as an STL file. Check it's a valid .stl export.");
     } finally {
       loadingEl.style.display = "none";
     }
   };
   reader.onerror = () => {
-    errorEl.textContent = "Something went wrong reading the file.";
-    errorEl.style.display = "block";
+    showError("Something went wrong reading the file.");
     loadingEl.style.display = "none";
   };
   reader.readAsArrayBuffer(file);
 }
 
-fileInput.addEventListener("change", (e) => handleFile(e.target.files?.[0]));
+async function handleStep(file) {
+  try {
+    loadingEl.textContent = "Loading CAD engine (first time only)\u2026";
+    const occt = await loadOcct();
+    loadingEl.textContent = "Parsing model\u2026";
+    const buffer = await file.arrayBuffer();
+    const result = occt.ReadStepFile(new Uint8Array(buffer), null);
+    if (!result.success || !result.meshes || result.meshes.length === 0) {
+      throw new Error("no geometry");
+    }
+    const specs = result.meshes.map((m) => ({
+      positions: Float32Array.from(m.attributes.position.array),
+      normals: m.attributes.normal ? Float32Array.from(m.attributes.normal.array) : null,
+      index: Uint32Array.from(m.index.array),
+      color: m.color || null,
+    }));
+    buildModel(specs);
+    onModelLoaded(file.name);
+  } catch (err) {
+    showError("Couldn't read this STEP file. It may be malformed, use unsupported entities, or the CAD engine failed to load (check your internet connection).");
+  } finally {
+    loadingEl.style.display = "none";
+    loadingEl.textContent = "Parsing model\u2026";
+  }
+}
+
+function routeFile(file) {
+  if (!file) return;
+  errorEl.style.display = "none";
+  loadingEl.style.display = "flex";
+  dropzoneHint.style.display = "none";
+
+  const ext = file.name.split(".").pop().toLowerCase();
+  if (ext === "stl") {
+    handleSTL(file);
+  } else if (ext === "stp" || ext === "step") {
+    handleStep(file);
+  } else {
+    loadingEl.style.display = "none";
+    showError("Unsupported file type. Please upload a .stl, .stp, or .step file.");
+  }
+}
+
+fileInput.addEventListener("change", (e) => routeFile(e.target.files?.[0]));
 
 viewport.addEventListener("dragover", (e) => {
   e.preventDefault();
@@ -317,7 +407,7 @@ viewport.addEventListener("drop", (e) => {
   e.preventDefault();
   viewport.classList.remove("dragover");
   const file = e.dataTransfer.files?.[0];
-  if (file) handleFile(file);
+  if (file) routeFile(file);
 });
 
 // ---------- axis scale controls ----------
@@ -343,7 +433,7 @@ function setAxis(axis, value) {
   } else {
     scale[axis] = value;
   }
-  if (mesh) mesh.scale.set(scale.x, scale.y, scale.z);
+  if (model) model.scale.set(scale.x, scale.y, scale.z);
   syncAxisUI();
   updateDims();
 }
@@ -365,13 +455,13 @@ lockBtn.addEventListener("click", () => {
 
 resetBtn.addEventListener("click", () => {
   scale = { x: 1, y: 1, z: 1 };
-  if (mesh) mesh.scale.set(1, 1, 1);
+  if (model) model.scale.set(1, 1, 1);
   syncAxisUI();
   updateDims();
 });
 
 fitBtn.addEventListener("click", () => {
-  if (!mesh || !baseSize) return;
+  if (!model || !baseSize) return;
   const sx = baseSize.x * scale.x;
   const sy = baseSize.y * scale.y;
   const sz = baseSize.z * scale.z;
@@ -399,6 +489,6 @@ screenshotBtn.addEventListener("click", () => {
   const url = renderer.domElement.toDataURL("image/png");
   const a = document.createElement("a");
   a.href = url;
-  a.download = (fileName ? fileName.replace(/\.stl$/i, "") : "model") + "-view.png";
+  a.download = (fileName ? fileName.replace(/\.(stl|stp|step)$/i, "") : "model") + "-view.png";
   a.click();
 });

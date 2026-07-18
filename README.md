@@ -1,9 +1,19 @@
-# STL Viewer
+# STL / STEP Viewer
 
-A single-page STL viewer: orbit/pan/zoom around an uploaded model, scale each
-axis independently, and export a screenshot. No build step, no npm install —
-just three files: `index.html`, `style.css`, `app.js`. three.js is loaded
-from a CDN at runtime.
+A single-page 3D model viewer: orbit/pan/zoom around an uploaded STL or STEP
+file, scale each axis independently, and export a screenshot. No build step,
+no npm install — just four files: `index.html`, `style.css`, `app.js`, and
+this README. three.js is loaded from a CDN at runtime.
+
+**Supported formats:** `.stl` (binary or ASCII) and `.stp`/`.step`.
+
+STL is parsed with a small hand-written parser and needs nothing else. STEP
+is a much more complex CAD format (parametric surfaces, not triangles), so
+STEP files are handled by [occt-import-js](https://github.com/kovacsv/occt-import-js) —
+a WebAssembly build of the OpenCascade CAD kernel that runs entirely in the
+browser and converts STEP geometry into a triangle mesh three.js can render.
+It's loaded lazily from a CDN the first time you open a STEP file, so
+STL-only use never downloads it.
 
 ## Run it locally (terminal)
 
@@ -42,6 +52,12 @@ These are static files, so any static host works. A couple of easy options:
 
 ## Notes
 
-- Everything runs client-side — uploaded STL files never leave the browser.
+- Everything runs client-side — uploaded files never leave the browser.
 - Works with both binary and ASCII STL files.
+- Opening a STEP file the first time in a session downloads the OpenCascade
+  WASM engine (a few MB) from a CDN, so an internet connection is required
+  for STEP support specifically. STL parsing has no such dependency beyond
+  the initial page load.
+- Very large or highly complex STEP assemblies can take a few seconds to
+  triangulate, since that work happens in-browser via WASM rather than on a server.
 - Touch support covers single-finger drag (orbit) and pinch isn't wired up yet — desktop mouse use is the primary target.
